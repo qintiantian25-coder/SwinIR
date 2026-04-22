@@ -117,12 +117,10 @@ def train_from_config(cfg: Dict[str, Any]):
         for i, batch in enumerate(loader):
             inp = batch['inp'].to(device)
             gt = batch['gt'].to(device)
-            mask = batch['mask'].to(device)
 
             if inp.dim() == 3:
                 inp = inp.unsqueeze(0)
                 gt = gt.unsqueeze(0)
-                mask = mask.unsqueeze(0)
 
             pred = model(inp)
 
@@ -133,20 +131,9 @@ def train_from_config(cfg: Dict[str, Any]):
                     gt = gt.repeat(1, 3, 1, 1)
 
             loss_map = torch.abs(pred - gt)
-            # 基础损失（L1），可选按 mask 加权
-            if use_mask:
-                mask_w = 1.0 + (alpha - 1.0) * mask
-                mask_w3 = mask_w.expand_as(loss_map)
-                base_loss = (loss_map * mask_w3).mean()
-            else:
-                base_loss = loss_map.mean()
-
-            # 可选的额外 mask 损失项（便于对 mask 区域施加独立约束）
-            if mask_loss_weight > 0.0:
-                mask_loss = (loss_map * mask).mean()
-                loss = base_loss + mask_loss_weight * mask_loss
-            else:
-                loss = base_loss
+            # 基础损失（L1）——不使用任何 mask 加权或额外的 mask 损失项
+            base_loss = loss_map.mean()
+            loss = base_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -171,11 +158,9 @@ def train_from_config(cfg: Dict[str, Any]):
                 for vbatch in val_loader:
                     vinp = vbatch['inp'].to(device)
                     vgt = vbatch['gt'].to(device)
-                    vmask = vbatch['mask'].to(device)
                     if vinp.dim() == 3:
                         vinp = vinp.unsqueeze(0)
                         vgt = vgt.unsqueeze(0)
-                        vmask = vmask.unsqueeze(0)
                     vpred = model(vinp)
                     if vpred.shape != vgt.shape:
                         if vpred.shape[1] == 1 and vgt.shape[1] == 3:
@@ -183,17 +168,8 @@ def train_from_config(cfg: Dict[str, Any]):
                         elif vpred.shape[1] == 3 and vgt.shape[1] == 1:
                             vgt = vgt.repeat(1, 3, 1, 1)
                     vloss_map = torch.abs(vpred - vgt)
-                    if use_mask:
-                        vmask_w = 1.0 + (alpha - 1.0) * vmask
-                        vmask_w3 = vmask_w.expand_as(vloss_map)
-                        vbase_loss = (vloss_map * vmask_w3).mean()
-                    else:
-                        vbase_loss = vloss_map.mean()
-                    if mask_loss_weight > 0.0:
-                        vmask_loss = (vloss_map * vmask).mean()
-                        vloss = vbase_loss + mask_loss_weight * vmask_loss
-                    else:
-                        vloss = vbase_loss
+                    vbase_loss = vloss_map.mean()
+                    vloss = vbase_loss
                     val_loss_acc += vloss.item()
                     val_steps += 1
             avg_val_loss = val_loss_acc / max(1, val_steps)
