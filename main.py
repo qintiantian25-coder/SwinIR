@@ -72,6 +72,8 @@ def train_from_config(cfg: Dict[str, Any]):
     epochs = int(tr_cfg.get('epochs', 10))
     lr = float(tr_cfg.get('lr', 2e-4))
     alpha = float(tr_cfg.get('alpha', 5.0))
+    mask_loss_weight = float(tr_cfg.get('mask_loss_weight', 0.0))
+    val_freq = int(tr_cfg.get('val_freq', 5))
     num_workers = int(tr_cfg.get('num_workers', 4))
     save_dir = tr_cfg.get('save_dir', 'experiments/fma_checkpoints')
     device_str = tr_cfg.get('device', 'cuda')
@@ -84,8 +86,28 @@ def train_from_config(cfg: Dict[str, Any]):
     ds = FMADataset(data_root, split=split, patch_size=patch_size, augment=True, gray_mode=gray_mode)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
 
+    # 可选的验证集（使用 data_root 下的 val_split_blur 文件夹）
+    val_split = ds_cfg.get('val_split', 'val')
+    val_loader = None
+    val_blur_dir = os.path.join(data_root, f"{val_split}_blur")
+    if os.path.isdir(val_blur_dir):
+        val_ds = FMADataset(data_root, split=val_split, patch_size=patch_size, augment=False, gray_mode=gray_mode)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=max(0, num_workers//2), pin_memory=True)
+        print(f'Validation loader created with split="{val_split}" and {len(val_ds)} items')
+
     model = build_model(device, in_chans=in_chans, img_size=patch_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    ckpt_best = os.path.join(save_dir, 'best_model.pth')
+    best_loss = float('inf')
+    if os.path.exists(ckpt_best):
+        try:
+            prev = torch.load(ckpt_best, map_location='cpu')
+            if isinstance(prev, dict) and 'best_loss' in prev:
+                best_loss = float(prev['best_loss'])
+                print(f'Loaded existing best_loss={best_loss} from {ckpt_best}')
+        except Exception:
+            print('Warning: failed to load existing best model; starting with best_loss=inf')
 
     global_step = 0
     for epoch in range(epochs):
@@ -111,12 +133,20 @@ def train_from_config(cfg: Dict[str, Any]):
                     gt = gt.repeat(1, 3, 1, 1)
 
             loss_map = torch.abs(pred - gt)
+            # 基础损失（L1），可选按 mask 加权
             if use_mask:
                 mask_w = 1.0 + (alpha - 1.0) * mask
                 mask_w3 = mask_w.expand_as(loss_map)
-                loss = (loss_map * mask_w3).mean()
+                base_loss = (loss_map * mask_w3).mean()
             else:
-                loss = loss_map.mean()
+                base_loss = loss_map.mean()
+
+            # 可选的额外 mask 损失项（便于对 mask 区域施加独立约束）
+            if mask_loss_weight > 0.0:
+                mask_loss = (loss_map * mask).mean()
+                loss = base_loss + mask_loss_weight * mask_loss
+            else:
+                loss = base_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -129,11 +159,58 @@ def train_from_config(cfg: Dict[str, Any]):
                 print(f'Epoch {epoch+1}/{epochs} Step {global_step} Loss {loss.item():.6f}')
 
         t1 = time.time()
-        print(f'Epoch {epoch+1} finished. Avg loss: {epoch_loss/len(loader):.6f}. Time: {t1-t0:.1f}s')
+        avg_loss = epoch_loss / len(loader)
+        print(f'Epoch {epoch+1} finished. Avg loss: {avg_loss:.6f}. Time: {t1-t0:.1f}s')
 
-        ckpt_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pth')
-        torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch+1}, ckpt_path)
-        print('Saved', ckpt_path)
+        # 仅在存在验证集且为验证轮（每 val_freq 轮）时，根据验证平均损失决定是否保存最优模型
+        if val_loader is not None and (epoch + 1) % val_freq == 0:
+            model.eval()
+            val_loss_acc = 0.0
+            val_steps = 0
+            with torch.no_grad():
+                for vbatch in val_loader:
+                    vinp = vbatch['inp'].to(device)
+                    vgt = vbatch['gt'].to(device)
+                    vmask = vbatch['mask'].to(device)
+                    if vinp.dim() == 3:
+                        vinp = vinp.unsqueeze(0)
+                        vgt = vgt.unsqueeze(0)
+                        vmask = vmask.unsqueeze(0)
+                    vpred = model(vinp)
+                    if vpred.shape != vgt.shape:
+                        if vpred.shape[1] == 1 and vgt.shape[1] == 3:
+                            vgt = vgt[:, 0:1, ...]
+                        elif vpred.shape[1] == 3 and vgt.shape[1] == 1:
+                            vgt = vgt.repeat(1, 3, 1, 1)
+                    vloss_map = torch.abs(vpred - vgt)
+                    if use_mask:
+                        vmask_w = 1.0 + (alpha - 1.0) * vmask
+                        vmask_w3 = vmask_w.expand_as(vloss_map)
+                        vbase_loss = (vloss_map * vmask_w3).mean()
+                    else:
+                        vbase_loss = vloss_map.mean()
+                    if mask_loss_weight > 0.0:
+                        vmask_loss = (vloss_map * vmask).mean()
+                        vloss = vbase_loss + mask_loss_weight * vmask_loss
+                    else:
+                        vloss = vbase_loss
+                    val_loss_acc += vloss.item()
+                    val_steps += 1
+            avg_val_loss = val_loss_acc / max(1, val_steps)
+            print(f'Validation after epoch {epoch+1}: avg_val_loss={avg_val_loss:.6f}')
+            if avg_val_loss < best_loss:
+                best_loss = avg_val_loss
+                ckpt_path = os.path.join(save_dir, 'best_model.pth')
+                tmp_path = ckpt_path + '.tmp'
+                torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch+1, 'best_loss': best_loss}, tmp_path)
+                try:
+                    os.replace(tmp_path, ckpt_path)
+                except Exception:
+                    os.rename(tmp_path, ckpt_path)
+                print('Saved best model (by val loss)', ckpt_path)
+        else:
+            # 非验证轮或没有验证集：不进行保存操作
+            pass
 
 
 def run_test_with_config(cfg: Dict[str, Any]):
@@ -152,6 +229,8 @@ def run_test_with_config(cfg: Dict[str, Any]):
         args += ['--test_mask_csv', str(test_cfg['test_mask_csv'])]
     if 'image_border' in test_cfg:
         args += ['--image_border', str(test_cfg['image_border'])]
+    if 'in_chans' in test_cfg:
+        args += ['--in_chans', str(test_cfg['in_chans'])]
 
     # replace sys.argv and import test_fma main
     old_argv = sys.argv

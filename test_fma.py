@@ -41,23 +41,29 @@ def build_model(device, in_chans=3):
     return model.to(device)
 
 
-def to_rgb_tensor_gray(img_gray):
-    # img_gray: HxW uint8 or float in [0,255] -> produce 3xHxW float32 in [0,1]
+def to_rgb_tensor_gray(img_gray, in_chans=3):
+    # img_gray: HxW uint8 or float in [0,255]
+    # if in_chans==3 -> produce 3xHxW float32 in [0,1]
+    # if in_chans==1 -> produce 1xHxW float32 in [0,1]
     if img_gray.dtype != np.float32:
         img = img_gray.astype(np.float32)
     else:
         img = img_gray
     if img.max() > 1.0:
         img = img / 255.0
-    img3 = np.stack([img, img, img], axis=2)
-    # transpose to CHW
-    img3 = img3.transpose(2, 0, 1)
-    return img3
+    if in_chans == 3:
+        img3 = np.stack([img, img, img], axis=2)
+        img3 = img3.transpose(2, 0, 1)
+        return img3
+    else:
+        img1 = img[np.newaxis, ...]
+        return img1
 
 
 def rgb_to_gray_from_tensor(out_np):
     # out_np: C x H x W in [0,1]
-    if out_np.ndim == 3:
+    # if 3-channel output, convert to gray; if single-channel, scale directly
+    if out_np.ndim == 3 and out_np.shape[0] == 3:
         r = out_np[0]
         g = out_np[1]
         b = out_np[2]
@@ -74,6 +80,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, required=True, help='dataset root')
     parser.add_argument('--checkpoint', type=str, required=True, help='model checkpoint (.pth)')
+    parser.add_argument('--in_chans', type=int, default=3, help='input channels used to build the model (1 or 3)')
     parser.add_argument('--save_dir', type=str, default='results/fma_test')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--test_mask_csv', type=str, default=None, help='csv of blind pixel coords')
@@ -88,7 +95,7 @@ def main():
     os.makedirs(save_pure, exist_ok=True)
 
     # build model and load checkpoint
-    model = build_model(device, in_chans=3)
+    model = build_model(device, in_chans=args.in_chans)
     ckpt = torch.load(args.checkpoint, map_location='cpu')
     # ckpt may contain 'model' or full state dict
     state = ckpt.get('model', ckpt)
@@ -133,8 +140,8 @@ def main():
                 continue
             H, W = in_img.shape[:2]
 
-            # prepare input tensor (3 channels)
-            inp_np = to_rgb_tensor_gray(in_img)
+            # prepare input tensor according to model input channels
+            inp_np = to_rgb_tensor_gray(in_img, in_chans=args.in_chans)
             inp_tensor = torch.from_numpy(inp_np).float().unsqueeze(0).to(device)
 
             out = model(inp_tensor)
