@@ -1,5 +1,6 @@
 import os
 import csv
+import re
 import numpy as np
 from PIL import Image
 import torch
@@ -38,27 +39,56 @@ class FMADataset(Dataset):
             raise RuntimeError(f"Blur dir not found: {self.blur_dir}")
 
         self.items = []
-        for sub in sorted(os.listdir(self.blur_dir)):
+        def _natural_key(x):
+            """Natural sort key that extracts integers from filenames for numeric ordering."""
+            parts = re.split(r'(\d+)', x)
+            key = []
+            for p in parts:
+                if p.isdigit():
+                    key.append(int(p))
+                else:
+                    key.append(p.lower())
+            return key
+
+        for sub in sorted(os.listdir(self.blur_dir), key=_natural_key):
             bsub = os.path.join(self.blur_dir, sub)
             ssub = os.path.join(self.sharp_dir, sub)
             msub = os.path.join(self.mask_dir, sub)
             if not os.path.isdir(bsub):
                 continue
-            # find fallback mask in msub (single mask image for the whole subfolder)
+            # find fallback mask or csv in msub (single mask image/CSV for the whole subfolder)
             fallback_mask = None
+            fallback_csv = None
             if os.path.isdir(msub):
-                for mf in sorted(os.listdir(msub)):
-                    if mf.lower().endswith('.png') or mf.lower().endswith('.jpg') or mf.lower().endswith('.jpeg'):
-                        fallback_mask = os.path.join(msub, mf)
-                        break
+                for mf in sorted(os.listdir(msub), key=_natural_key):
+                    low = mf.lower()
+                    if low.endswith('.png') or low.endswith('.jpg') or low.endswith('.jpeg'):
+                        if fallback_mask is None:
+                            fallback_mask = os.path.join(msub, mf)
+                    if low.endswith('.csv'):
+                        # prefer a CSV named like 'blind' or 'coords', otherwise first CSV
+                        if fallback_csv is None:
+                            fallback_csv = os.path.join(msub, mf)
+                        if 'blind' in low or 'coord' in low or 'coords' in low:
+                            fallback_csv = os.path.join(msub, mf)
+                            # prefer this explicit coords csv
+                            break
 
             for fn in sorted(os.listdir(bsub)):
                 fb = os.path.join(bsub, fn)
                 fs = os.path.join(ssub, fn)
-                fm = os.path.join(msub, fn)
+                # possible per-frame mask: same filename (image) or same basename + .csv
+                m_img = os.path.join(msub, fn)
+                base, _ext = os.path.splitext(fn)
+                m_csv = os.path.join(msub, base + '.csv')
+
                 if os.path.isfile(fb) and os.path.isfile(fs):
-                    if os.path.isfile(fm):
-                        self.items.append((fb, fs, fm))
+                    if os.path.isfile(m_img):
+                        self.items.append((fb, fs, m_img))
+                    elif os.path.isfile(m_csv):
+                        self.items.append((fb, fs, m_csv))
+                    elif fallback_csv is not None:
+                        self.items.append((fb, fs, fallback_csv))
                     elif fallback_mask is not None:
                         # use the single mask image for all files in this subfolder
                         self.items.append((fb, fs, fallback_mask))

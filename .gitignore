@@ -1,2 +1,11 @@
+# Python 编译文件
+*.pyc
+__pycache__/
 data/
 experiments/
+
+# 评估结果 CSV
+per_image_metrics.csv
+
+# 测试输出图像（整个 results 目录建议直接忽略）
+results/
