@@ -96,6 +96,14 @@ def train_from_config(cfg: Dict[str, Any]):
         print(f'Validation loader created with split="{val_split}" and {len(val_ds)} items')
 
     model = build_model(device, in_chans=in_chans, img_size=patch_size)
+    # 如果有多张 GPU，则使用 DataParallel 包装模型以利用多卡并减小单卡显存压力
+    try:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1 and 'cuda' in device_str:
+            model = torch.nn.DataParallel(model)
+            print(f'Using DataParallel with {torch.cuda.device_count()} GPUs')
+    except Exception:
+        # 任何包装失败都不应阻止训练；保持原模型
+        pass
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     ckpt_best = os.path.join(save_dir, 'best_model.pth')
