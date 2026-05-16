@@ -8,6 +8,7 @@ from typing import Any, Dict
 
 import torch
 from torch.utils.data import DataLoader
+from utils.util_calculate_psnr_ssim import calculate_psnr
 
 from datasets.fma_dataset import FMADataset
 from models.network_swinir import SwinIR as Net
@@ -83,6 +84,18 @@ def train_from_config(cfg: Dict[str, Any]):
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device(device_str if torch.cuda.is_available() and 'cuda' in device_str else 'cpu')
 
+    # 日志文件（保存在 save_dir）
+    train_log_path = os.path.join(save_dir, 'train.log')
+    val_log_path = os.path.join(save_dir, 'val.log')
+    # 如果日志文件不存在，写入表头
+    if not os.path.exists(train_log_path):
+        with open(train_log_path, 'w', encoding='utf-8') as f:
+            f.write('epoch,avg_train_loss,time_s\n')
+    # val log includes a flag whether this validation saved a new best model
+    if not os.path.exists(val_log_path):
+        with open(val_log_path, 'w', encoding='utf-8') as f:
+            f.write('epoch,avg_val_loss,avg_psnr,best_saved\n')
+
     ds = FMADataset(data_root, split=split, patch_size=patch_size, augment=True, gray_mode=gray_mode)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
 
@@ -155,13 +168,21 @@ def train_from_config(cfg: Dict[str, Any]):
 
         t1 = time.time()
         avg_loss = epoch_loss / len(loader)
-        print(f'Epoch {epoch+1} finished. Avg loss: {avg_loss:.6f}. Time: {t1-t0:.1f}s')
+        epoch_time = t1 - t0
+        print(f'Epoch {epoch+1} finished. Avg loss: {avg_loss:.6f}. Time: {epoch_time:.1f}s')
+        # 写训练日志
+        try:
+            with open(train_log_path, 'a', encoding='utf-8') as f:
+                f.write(f"{epoch+1},{avg_loss:.6f},{epoch_time:.1f}\n")
+        except Exception:
+            pass
 
         # 仅在存在验证集且为验证轮（每 val_freq 轮）时，根据验证平均损失决定是否保存最优模型
         if val_loader is not None and (epoch + 1) % val_freq == 0:
             model.eval()
             val_loss_acc = 0.0
             val_steps = 0
+            psnr_acc = 0.0
             with torch.no_grad():
                 for vbatch in val_loader:
                     vinp = vbatch['inp'].to(device)
@@ -179,19 +200,48 @@ def train_from_config(cfg: Dict[str, Any]):
                     vbase_loss = vloss_map.mean()
                     vloss = vbase_loss
                     val_loss_acc += vloss.item()
+                    # 计算批内每张图像的 PSNR
+                    try:
+                        vpred_np = (vpred.clamp(0, 1).cpu().numpy() * 255.0).astype('float32')
+                        vgt_np = (vgt.clamp(0, 1).cpu().numpy() * 255.0).astype('float32')
+                        # vpred_np shape: (B, C, H, W)
+                        for j in range(vpred_np.shape[0]):
+                            pred_img = vpred_np[j].transpose(1, 2, 0)  # HWC
+                            gt_img = vgt_np[j].transpose(1, 2, 0)
+                            try:
+                                p = calculate_psnr(pred_img, gt_img, crop_border=0, input_order='HWC', test_y_channel=False)
+                            except Exception:
+                                p = float('nan')
+                            if not (p != p):
+                                psnr_acc += p
+                    except Exception:
+                        pass
                     val_steps += 1
             avg_val_loss = val_loss_acc / max(1, val_steps)
-            print(f'Validation after epoch {epoch+1}: avg_val_loss={avg_val_loss:.6f}')
-            if avg_val_loss < best_loss:
+            # 计算并打印 PSNR
+            try:
+                avg_psnr = psnr_acc / max(1, val_steps)
+            except Exception:
+                avg_psnr = float('nan')
+
+            is_best = avg_val_loss < best_loss
+            print(f'Validation after epoch {epoch+1}: avg_val_loss={avg_val_loss:.6f} avg_psnr={avg_psnr:.3f} best_saved={int(is_best)}')
+            # 写验证日志（包括是否保存为新的 best）
+            try:
+                with open(val_log_path, 'a', encoding='utf-8') as f:
+                    f.write(f"{epoch+1},{avg_val_loss:.6f},{avg_psnr:.3f},{int(is_best)}\n")
+            except Exception:
+                pass
+            if is_best:
                 best_loss = avg_val_loss
                 ckpt_path = os.path.join(save_dir, 'best_model.pth')
                 tmp_path = ckpt_path + '.tmp'
-                torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch+1, 'best_loss': best_loss}, tmp_path)
+                torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch+1, 'best_loss': best_loss, 'best_psnr': avg_psnr}, tmp_path)
                 try:
                     os.replace(tmp_path, ckpt_path)
                 except Exception:
                     os.rename(tmp_path, ckpt_path)
-                print('Saved best model (by val loss)', ckpt_path)
+                print(f'Saved best model (by val loss) {ckpt_path} best_psnr={avg_psnr:.3f}')
         else:
             # 非验证轮或没有验证集：不进行保存操作
             pass
