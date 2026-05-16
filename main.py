@@ -5,6 +5,7 @@ import json
 import argparse
 import configparser
 from typing import Any, Dict
+from contextlib import nullcontext
 
 import torch
 from torch.utils.data import DataLoader
@@ -51,10 +52,10 @@ def load_config(path: str) -> Dict[str, Any]:
     return out
 
 
-def build_model(device, in_chans=3, img_size=128):
+def build_model(device, in_chans=3, img_size=128, use_checkpoint=False):
     model = Net(upscale=1, in_chans=in_chans, img_size=img_size, window_size=8,
                 img_range=1., depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
-                mlp_ratio=2, upsampler='', resi_connection='1conv')
+                mlp_ratio=2, upsampler='', resi_connection='1conv', use_checkpoint=use_checkpoint)
     return model.to(device)
 
 
@@ -99,6 +100,8 @@ def train_from_config(cfg: Dict[str, Any]):
     device_str = tr_cfg.get('device', 'cuda')
     in_chans = int(tr_cfg.get('in_chans', 1))
     use_mask = bool(tr_cfg.get('use_mask', False))
+    mixed_precision = bool(tr_cfg.get('mixed_precision', False))
+    use_checkpoint = bool(tr_cfg.get('use_checkpoint', True))
 
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device(device_str if torch.cuda.is_available() and 'cuda' in device_str else 'cpu')
@@ -127,7 +130,7 @@ def train_from_config(cfg: Dict[str, Any]):
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=max(0, num_workers//2), pin_memory=True)
         print(f'Validation loader created with split="{val_split}" and {len(val_ds)} items')
 
-    model = build_model(device, in_chans=in_chans, img_size=patch_size)
+    model = build_model(device, in_chans=in_chans, img_size=patch_size, use_checkpoint=use_checkpoint)
     # 如果有多张 GPU，则使用 DataParallel 包装模型以利用多卡并减小单卡显存压力
     try:
         if torch.cuda.is_available() and torch.cuda.device_count() > 1 and 'cuda' in device_str:
@@ -137,6 +140,7 @@ def train_from_config(cfg: Dict[str, Any]):
         # 任何包装失败都不应阻止训练；保持原模型
         pass
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=(mixed_precision and device.type == 'cuda'))
 
     ckpt_best = os.path.join(save_dir, 'best_model.pth')
     best_loss = float('inf')
@@ -162,22 +166,30 @@ def train_from_config(cfg: Dict[str, Any]):
                 inp = inp.unsqueeze(0)
                 gt = gt.unsqueeze(0)
 
-            pred = model(inp)
+            optimizer.zero_grad(set_to_none=True)
+            amp_enabled = scaler.is_enabled()
+            amp_ctx = torch.cuda.amp.autocast(enabled=amp_enabled) if device.type == 'cuda' else nullcontext()
+            with amp_ctx:
+                pred = model(inp)
 
-            if pred.shape != gt.shape:
-                if pred.shape[1] == 1 and gt.shape[1] == 3:
-                    gt = gt[:, 0:1, ...]
-                elif pred.shape[1] == 3 and gt.shape[1] == 1:
-                    gt = gt.repeat(1, 3, 1, 1)
+                if pred.shape != gt.shape:
+                    if pred.shape[1] == 1 and gt.shape[1] == 3:
+                        gt = gt[:, 0:1, ...]
+                    elif pred.shape[1] == 3 and gt.shape[1] == 1:
+                        gt = gt.repeat(1, 3, 1, 1)
 
-            loss_map = torch.abs(pred - gt)
-            # 基础损失（L1）——不使用任何 mask 加权或额外的 mask 损失项
-            base_loss = loss_map.mean()
-            loss = base_loss
+                loss_map = torch.abs(pred - gt)
+                # 基础损失（L1）——不使用任何 mask 加权或额外的 mask 损失项
+                base_loss = loss_map.mean()
+                loss = base_loss
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             epoch_loss += loss.item()
             global_step += 1
@@ -210,7 +222,9 @@ def train_from_config(cfg: Dict[str, Any]):
                     if vinp.dim() == 3:
                         vinp = vinp.unsqueeze(0)
                         vgt = vgt.unsqueeze(0)
-                    vpred = model(vinp)
+                    val_amp_ctx = torch.cuda.amp.autocast(enabled=scaler.is_enabled()) if device.type == 'cuda' else nullcontext()
+                    with val_amp_ctx:
+                        vpred = model(vinp)
                     if vpred.shape != vgt.shape:
                         if vpred.shape[1] == 1 and vgt.shape[1] == 3:
                             vgt = vgt[:, 0:1, ...]
