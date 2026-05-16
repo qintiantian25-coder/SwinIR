@@ -188,6 +188,7 @@ def train_from_config(cfg: Dict[str, Any]):
             val_loss_acc = 0.0
             val_steps = 0
             psnr_acc = 0.0
+            psnr_count = 0
             with torch.no_grad():
                 for vbatch in val_loader:
                     vinp = vbatch['inp'].to(device)
@@ -219,13 +220,14 @@ def train_from_config(cfg: Dict[str, Any]):
                                 p = float('nan')
                             if not (p != p):
                                 psnr_acc += p
+                                psnr_count += 1
                     except Exception:
                         pass
                     val_steps += 1
             avg_val_loss = val_loss_acc / max(1, val_steps)
             # 计算并打印 PSNR
             try:
-                avg_psnr = psnr_acc / max(1, val_steps)
+                avg_psnr = psnr_acc / max(1, psnr_count)
             except Exception:
                 avg_psnr = float('nan')
 
