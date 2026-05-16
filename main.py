@@ -197,7 +197,7 @@ def train_from_config(cfg: Dict[str, Any]):
         # 任何包装失败都不应阻止训练；保持原模型
         pass
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=(mixed_precision and device.type == 'cuda'))
+    scaler = torch.amp.GradScaler('cuda', enabled=(mixed_precision and device.type == 'cuda'))
 
     ckpt_best = os.path.join(save_dir, 'best_model.pth')
     start_epoch = 0
@@ -244,7 +244,7 @@ def train_from_config(cfg: Dict[str, Any]):
 
             optimizer.zero_grad(set_to_none=True)
             amp_enabled = scaler.is_enabled()
-            amp_ctx = torch.cuda.amp.autocast(enabled=amp_enabled) if device.type == 'cuda' else nullcontext()
+            amp_ctx = torch.amp.autocast('cuda', enabled=amp_enabled) if device.type == 'cuda' else nullcontext()
             with amp_ctx:
                 pred = model(inp)
 
@@ -298,7 +298,7 @@ def train_from_config(cfg: Dict[str, Any]):
                     if vinp.dim() == 3:
                         vinp = vinp.unsqueeze(0)
                         vgt = vgt.unsqueeze(0)
-                    val_amp_ctx = torch.cuda.amp.autocast(enabled=scaler.is_enabled()) if device.type == 'cuda' else nullcontext()
+                    val_amp_ctx = torch.amp.autocast('cuda', enabled=scaler.is_enabled()) if device.type == 'cuda' else nullcontext()
                     with val_amp_ctx:
                         vpred = model(vinp)
                     if vpred.shape != vgt.shape:
