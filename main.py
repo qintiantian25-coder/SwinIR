@@ -80,6 +80,8 @@ def train_from_config(cfg: Dict[str, Any]):
         val_freq = int(val_cfg.get('val_every', tr_cfg.get('val_freq', 5)))
     except Exception:
         val_freq = int(tr_cfg.get('val_freq', 5))
+    # debug: print effective validation frequency
+    print(f'CONFIG: validation.val_every={val_cfg.get("val_every")}, train.val_freq={tr_cfg.get("val_freq")}, effective val_freq={val_freq}')
     num_workers = int(tr_cfg.get('num_workers', 4))
     save_dir = tr_cfg.get('save_dir', 'experiments/fma_checkpoints')
     device_str = tr_cfg.get('device', 'cuda')
