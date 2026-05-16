@@ -74,7 +74,12 @@ def train_from_config(cfg: Dict[str, Any]):
     lr = float(tr_cfg.get('lr', 2e-4))
     alpha = float(tr_cfg.get('alpha', 5.0))
     mask_loss_weight = float(tr_cfg.get('mask_loss_weight', 0.0))
-    val_freq = int(tr_cfg.get('val_freq', 5))
+    # 验证频率：优先使用 [validation].val_every（由 experiment.cfg 控制），回退到 [train].val_freq，再回退到默认 5
+    val_cfg = cfg.get('validation', {})
+    try:
+        val_freq = int(val_cfg.get('val_every', tr_cfg.get('val_freq', 5)))
+    except Exception:
+        val_freq = int(tr_cfg.get('val_freq', 5))
     num_workers = int(tr_cfg.get('num_workers', 4))
     save_dir = tr_cfg.get('save_dir', 'experiments/fma_checkpoints')
     device_str = tr_cfg.get('device', 'cuda')
