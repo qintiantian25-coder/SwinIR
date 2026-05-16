@@ -59,6 +59,52 @@ def build_model(device, in_chans=3, img_size=128, use_checkpoint=False):
     return model.to(device)
 
 
+def _unwrap_state_dict(state_dict):
+    """Remove DataParallel 'module.' prefix when needed."""
+    if not isinstance(state_dict, dict):
+        return state_dict
+    if any(k.startswith('module.') for k in state_dict.keys()):
+        return {k[len('module.'):]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def _load_training_checkpoint(ckpt_path, model, optimizer=None, scaler=None, map_location='cpu'):
+    """Load training checkpoint and restore model/optimizer/scaler states if available."""
+    ckpt = torch.load(ckpt_path, map_location=map_location)
+    state = ckpt.get('model', ckpt)
+    state = _unwrap_state_dict(state)
+    model_state = model.state_dict()
+    # tolerate module prefix mismatches when wrapping/unwrapping DataParallel
+    if all(k.startswith('module.') for k in model_state.keys()) and not any(k.startswith('module.') for k in state.keys()):
+        state = {f'module.{k}': v for k, v in state.items()}
+    elif not any(k.startswith('module.') for k in model_state.keys()) and any(k.startswith('module.') for k in state.keys()):
+        state = _unwrap_state_dict(state)
+    model.load_state_dict(state, strict=True)
+
+    start_epoch = int(ckpt.get('epoch', 0))
+    global_step = int(ckpt.get('global_step', 0))
+    best_loss = float(ckpt.get('best_loss', float('inf')))
+    best_psnr = float(ckpt.get('best_psnr', float('nan')))
+
+    if optimizer is not None and 'optimizer' in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        except Exception:
+            pass
+    if scaler is not None and 'scaler' in ckpt and hasattr(scaler, 'load_state_dict'):
+        try:
+            scaler.load_state_dict(ckpt['scaler'])
+        except Exception:
+            pass
+
+    return {
+        'epoch': start_epoch,
+        'global_step': global_step,
+        'best_loss': best_loss,
+        'best_psnr': best_psnr,
+    }
+
+
 def tensor_to_gray_uint8(chw_tensor: torch.Tensor):
     """Match test-time gray conversion: CxHxW in [0,1] -> HxW uint8."""
     t = chw_tensor.detach().float().clamp(0, 1).cpu()
@@ -118,6 +164,17 @@ def train_from_config(cfg: Dict[str, Any]):
         with open(val_log_path, 'w', encoding='utf-8') as f:
             f.write('epoch,avg_val_loss,avg_psnr,best_saved\n')
 
+    resume_from = str(tr_cfg.get('resume_from', '')).strip()
+    last_ckpt_path = os.path.join(save_dir, 'last_model.pth')
+    resume_ckpt_path = None
+    if resume_from.lower() == 'auto' or not resume_from:
+        if os.path.exists(last_ckpt_path):
+            resume_ckpt_path = last_ckpt_path
+        elif os.path.exists(os.path.join(save_dir, 'best_model.pth')):
+            resume_ckpt_path = os.path.join(save_dir, 'best_model.pth')
+    elif resume_from:
+        resume_ckpt_path = os.path.expanduser(resume_from)
+
     ds = FMADataset(data_root, split=split, patch_size=patch_size, augment=True, gray_mode=gray_mode)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
 
@@ -143,7 +200,10 @@ def train_from_config(cfg: Dict[str, Any]):
     scaler = torch.cuda.amp.GradScaler(enabled=(mixed_precision and device.type == 'cuda'))
 
     ckpt_best = os.path.join(save_dir, 'best_model.pth')
+    start_epoch = 0
+    global_step = 0
     best_loss = float('inf')
+    best_psnr = float('nan')
     if os.path.exists(ckpt_best):
         try:
             prev = torch.load(ckpt_best, map_location='cpu')
@@ -153,8 +213,24 @@ def train_from_config(cfg: Dict[str, Any]):
         except Exception:
             print('Warning: failed to load existing best model; starting with best_loss=inf')
 
-    global_step = 0
-    for epoch in range(epochs):
+    if resume_ckpt_path is not None and os.path.exists(resume_ckpt_path):
+        try:
+            resume_info = _load_training_checkpoint(
+                resume_ckpt_path,
+                model,
+                optimizer=optimizer,
+                scaler=scaler,
+                map_location='cpu'
+            )
+            start_epoch = int(resume_info['epoch'])
+            global_step = int(resume_info['global_step'])
+            best_loss = float(resume_info['best_loss'])
+            best_psnr = float(resume_info['best_psnr'])
+            print(f"Resumed from {resume_ckpt_path}: start_epoch={start_epoch}, global_step={global_step}, best_loss={best_loss}, best_psnr={best_psnr}")
+        except Exception as e:
+            print(f'Warning: failed to resume from {resume_ckpt_path}: {e}')
+
+    for epoch in range(start_epoch, epochs):
         model.train()
         epoch_loss = 0.0
         t0 = time.time()
@@ -266,17 +342,25 @@ def train_from_config(cfg: Dict[str, Any]):
                 pass
             if is_best:
                 best_loss = avg_val_loss
+                best_psnr = avg_psnr
                 ckpt_path = os.path.join(save_dir, 'best_model.pth')
                 tmp_path = ckpt_path + '.tmp'
-                torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch+1, 'best_loss': best_loss, 'best_psnr': avg_psnr}, tmp_path)
+                torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict() if hasattr(scaler, 'state_dict') else None, 'epoch': epoch+1, 'global_step': global_step, 'best_loss': best_loss, 'best_psnr': avg_psnr}, tmp_path)
                 try:
                     os.replace(tmp_path, ckpt_path)
                 except Exception:
                     os.rename(tmp_path, ckpt_path)
                 print(f'Saved best model (by val loss) {ckpt_path} best_psnr={avg_psnr:.3f}')
-        else:
-            # 非验证轮或没有验证集：不进行保存操作
-            pass
+
+        # always save last checkpoint so training can be resumed anytime from epoch boundaries
+        last_ckpt_path = os.path.join(save_dir, 'last_model.pth')
+        last_tmp_path = last_ckpt_path + '.tmp'
+        torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict() if hasattr(scaler, 'state_dict') else None, 'epoch': epoch + 1, 'global_step': global_step, 'best_loss': best_loss, 'best_psnr': best_psnr}, last_tmp_path)
+        try:
+            os.replace(last_tmp_path, last_ckpt_path)
+        except Exception:
+            os.rename(last_tmp_path, last_ckpt_path)
+        print(f'Saved last checkpoint {last_ckpt_path}')
 
 
 def run_test_with_config(cfg: Dict[str, Any]):
