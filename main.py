@@ -58,6 +58,19 @@ def build_model(device, in_chans=3, img_size=128):
     return model.to(device)
 
 
+def tensor_to_gray_uint8(chw_tensor: torch.Tensor):
+    """Match test-time gray conversion: CxHxW in [0,1] -> HxW uint8."""
+    t = chw_tensor.detach().float().clamp(0, 1).cpu()
+    if t.dim() != 3:
+        raise ValueError(f'Expected CxHxW tensor, got shape={tuple(t.shape)}')
+    if t.shape[0] == 3:
+        gray = 0.2989 * t[0] + 0.5870 * t[1] + 0.1140 * t[2]
+    else:
+        gray = t[0]
+    gray = (gray * 255.0).round().clamp(0, 255).to(torch.uint8)
+    return gray.numpy()
+
+
 def train_from_config(cfg: Dict[str, Any]):
     ds_cfg = cfg.get('dataset', {})
     tr_cfg = cfg.get('train', {})
@@ -80,6 +93,7 @@ def train_from_config(cfg: Dict[str, Any]):
         val_freq = int(val_cfg.get('val_every', tr_cfg.get('val_freq', 5)))
     except Exception:
         val_freq = int(tr_cfg.get('val_freq', 5))
+    val_image_border = int(val_cfg.get('image_border', 0))
     num_workers = int(tr_cfg.get('num_workers', 4))
     save_dir = tr_cfg.get('save_dir', 'experiments/fma_checkpoints')
     device_str = tr_cfg.get('device', 'cuda')
@@ -206,16 +220,13 @@ def train_from_config(cfg: Dict[str, Any]):
                     vbase_loss = vloss_map.mean()
                     vloss = vbase_loss
                     val_loss_acc += vloss.item()
-                    # 计算批内每张图像的 PSNR
+                    # 计算批内每张图像的 PSNR（与 test_fma.py 一致：先转灰度 uint8）
                     try:
-                        vpred_np = (vpred.clamp(0, 1).cpu().numpy() * 255.0).astype('float32')
-                        vgt_np = (vgt.clamp(0, 1).cpu().numpy() * 255.0).astype('float32')
-                        # vpred_np shape: (B, C, H, W)
-                        for j in range(vpred_np.shape[0]):
-                            pred_img = vpred_np[j].transpose(1, 2, 0)  # HWC
-                            gt_img = vgt_np[j].transpose(1, 2, 0)
+                        for j in range(vpred.shape[0]):
+                            pred_gray = tensor_to_gray_uint8(vpred[j])
+                            gt_gray = tensor_to_gray_uint8(vgt[j])
                             try:
-                                p = calculate_psnr(pred_img, gt_img, crop_border=0, input_order='HWC', test_y_channel=False)
+                                p = calculate_psnr(pred_gray, gt_gray, crop_border=val_image_border)
                             except Exception:
                                 p = float('nan')
                             if not (p != p):
