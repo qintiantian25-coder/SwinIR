@@ -123,13 +123,18 @@ def main():
     model.load_state_dict(state)
     model.eval()
 
-    # gather gt map
+    # gather gt map (use relative path keys to avoid basename collisions across subfolders)
     gt_root = os.path.join(args.data_root, 'test_sharp')
     gt_map = {}
     for root, _, files in os.walk(gt_root):
         for f in files:
             if f.lower().endswith('.png'):
-                gt_map[f] = os.path.join(root, f)
+                full = os.path.join(root, f)
+                rel = os.path.normpath(os.path.relpath(full, gt_root))
+                gt_map[rel] = full
+                # also register basename as a fallback if not already present
+                if f not in gt_map:
+                    gt_map[f] = full
 
     # gather input images (test_blur)
     input_root = os.path.join(args.data_root, 'test_blur')
@@ -154,6 +159,9 @@ def main():
     with torch.no_grad():
         for idx, in_path in enumerate(input_files):
             name = os.path.basename(in_path)
+            # try to find GT by relative path first (preserve subfolder structure),
+            # fall back to basename lookup for backward compatibility
+            rel_in = os.path.normpath(os.path.relpath(in_path, input_root))
             # load input (gray)
             in_img = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
             if in_img is None:
@@ -171,8 +179,8 @@ def main():
             out_gray = rgb_to_gray_from_tensor(out)
 
             # save output and triple
-            # load gt
-            gt_path = gt_map.get(name)
+            # load gt (prefer relative-match, then basename)
+            gt_path = gt_map.get(rel_in, gt_map.get(name))
             if gt_path and os.path.exists(gt_path):
                 gt_img = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
                 if gt_img is None:
