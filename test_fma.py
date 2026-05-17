@@ -53,6 +53,20 @@ def load_blind_coords(csv_path):
     return arr
 
 
+def resolve_csv_path(csv_path, data_root):
+    if not csv_path:
+        return None
+    if os.path.isabs(csv_path) and os.path.exists(csv_path):
+        return csv_path
+    if os.path.exists(csv_path):
+        return csv_path
+    if data_root:
+        candidate = os.path.join(data_root, csv_path)
+        if os.path.exists(candidate):
+            return candidate
+    return csv_path
+
+
 def build_model(device, in_chans=3):
     model = Net(upscale=1, in_chans=in_chans, img_size=128, window_size=8,
                 img_range=1., depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
@@ -179,7 +193,13 @@ def main():
         grouped_inputs[get_group_name(rel_in)].append(in_path)
 
     # load blind coords (CSV) if provided
-    blind_coords = load_blind_coords(args.test_mask_csv) if args.test_mask_csv else None
+    resolved_test_mask_csv = resolve_csv_path(args.test_mask_csv, args.data_root)
+    blind_coords = load_blind_coords(resolved_test_mask_csv) if resolved_test_mask_csv else None
+    if args.test_mask_csv and blind_coords is None:
+        print(f'WARN: blind coords CSV not loaded: {resolved_test_mask_csv}')
+        print('WARN: blind metrics will stay empty until the CSV path is correct and the file has x,y columns.')
+    elif blind_coords is not None:
+        print(f'Loaded blind coords from: {resolved_test_mask_csv} ({len(blind_coords)} unique points)')
 
     report = TestReport(crop_border=args.image_border)
     blind_abs_sum = 0.0
@@ -282,6 +302,8 @@ def main():
                             if row['blind_mae_input'] is not None:
                                 row['blind_mae_gain_abs'] = row['blind_mae_input'] - row['blind_mae']
                                 row['blind_mae_gain_pct'] = 100.0 * row['blind_mae_gain_abs'] / (row['blind_mae_input'] + 1e-12)
+                        else:
+                            print(f'WARN: no valid blind coords inside image bounds for {name}')
 
                     per_image_logs.append(row)
                     group_rows.append(row)
