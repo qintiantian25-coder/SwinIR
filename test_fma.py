@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 import torch
 import glob
+from collections import defaultdict
 
 from models.network_swinir import SwinIR as Net
 from utils import util_calculate_psnr_ssim as util
@@ -94,6 +95,13 @@ def rgb_to_gray_from_tensor(out_np):
         return gray
 
 
+def get_group_name(rel_path):
+    parts = os.path.normpath(rel_path).split(os.sep)
+    if len(parts) > 1:
+        return parts[0]
+    return 'root'
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, required=True, help='dataset root')
@@ -165,17 +173,10 @@ def main():
                 input_files.append(os.path.join(root, f))
     input_files = sorted(input_files, key=natural_sort_key)
 
-    output_map = {}
-    input_map = {}
+    grouped_inputs = defaultdict(list)
     for in_path in input_files:
         rel_in = os.path.normpath(os.path.relpath(in_path, input_root))
-        name = os.path.basename(in_path)
-        output_map[rel_in] = os.path.join(save_pure, name)
-        if name not in output_map:
-            output_map[name] = os.path.join(save_pure, name)
-        input_map[rel_in] = in_path
-        if name not in input_map:
-            input_map[name] = in_path
+        grouped_inputs[get_group_name(rel_in)].append(in_path)
 
     # load blind coords (CSV) if provided
     blind_coords = load_blind_coords(args.test_mask_csv) if args.test_mask_csv else None
@@ -187,114 +188,126 @@ def main():
     blind_sq_in_sum = 0.0
     blind_pix_sum = 0
     per_image_logs = []
+    per_group_logs = defaultdict(list)
 
     print(f'===> 开始定量打分，准备比对 {len(input_files)} 张图片...')
     with torch.no_grad():
-        for idx, in_path in enumerate(input_files):
-            name = os.path.basename(in_path)
-            # try to find GT by relative path first (preserve subfolder structure),
-            # fall back to basename lookup for backward compatibility
-            rel_in = os.path.normpath(os.path.relpath(in_path, input_root))
-            # load input (gray)
-            in_img = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
-            if in_img is None:
-                print('WARN: failed to load', in_path)
-                continue
-            H, W = in_img.shape[:2]
+        for group_name, group_files in grouped_inputs.items():
+            print(f'===> Processing group {group_name} ({len(group_files)} images) ...')
+            group_rows = []
 
-            # prepare input tensor according to model input channels
-            inp_np = to_rgb_tensor_gray(in_img, in_chans=args.in_chans)
-            inp_tensor = torch.from_numpy(inp_np).float().unsqueeze(0).to(device)
+            for idx, in_path in enumerate(group_files):
+                name = os.path.basename(in_path)
+                rel_in = os.path.normpath(os.path.relpath(in_path, input_root))
 
-            out = model(inp_tensor)
-            out = out.clamp(0, 1).cpu().numpy()[0]  # C,H,W
-
-            out_gray = rgb_to_gray_from_tensor(out)
-
-            # save output and triple
-            # load gt (prefer relative-match, then basename)
-            gt_path = gt_map.get(rel_in, gt_map.get(name))
-            if gt_path and os.path.exists(gt_path):
-                gt_img = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
-                if gt_img is None:
-                    print('WARN: failed to load gt for', name)
+                in_img = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+                if in_img is None:
+                    print('WARN: failed to load', in_path)
                     continue
-                # align sizes
-                if out_gray.shape != gt_img.shape:
-                    out_gray = cv2.resize(out_gray, (gt_img.shape[1], gt_img.shape[0]))
-                if in_img.shape != gt_img.shape:
-                    in_resized = cv2.resize(in_img, (gt_img.shape[1], gt_img.shape[0]))
+
+                inp_np = to_rgb_tensor_gray(in_img, in_chans=args.in_chans)
+                inp_tensor = torch.from_numpy(inp_np).float().unsqueeze(0).to(device)
+
+                out = model(inp_tensor)
+                out = out.clamp(0, 1).cpu().numpy()[0]
+                out_gray = rgb_to_gray_from_tensor(out)
+
+                gt_path = gt_map.get(rel_in, gt_map.get(name))
+                if gt_path and os.path.exists(gt_path):
+                    gt_img = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
+                    if gt_img is None:
+                        print('WARN: failed to load gt for', name)
+                        continue
+
+                    if out_gray.shape != gt_img.shape:
+                        out_gray = cv2.resize(out_gray, (gt_img.shape[1], gt_img.shape[0]))
+                    if in_img.shape != gt_img.shape:
+                        in_resized = cv2.resize(in_img, (gt_img.shape[1], gt_img.shape[0]))
+                    else:
+                        in_resized = in_img
+
+                    triple = np.concatenate([in_resized, out_gray, gt_img], axis=1)
+                    cv2.imwrite(os.path.join(save_triple, f'triple_{name}'), triple)
+                    cv2.imwrite(os.path.join(save_pure, name), out_gray)
+
+                    report.update_metric(gt_img, out_gray, name)
+                    full_psnr = float(report.total_rgb_psnr[-1])
+                    full_ssim = float(report.total_ssim[-1])
+
+                    row = {
+                        'image': name,
+                        'psnr': float(full_psnr),
+                        'ssim': float(full_ssim),
+                        'blind_mae': None,
+                        'blind_rmse': None,
+                        'blind_psnr': None,
+                        'blind_mae_input': None,
+                        'blind_mae_gain_abs': None,
+                        'blind_mae_gain_pct': None,
+                        'blind_count': 0
+                    }
+
+                    if blind_coords is not None and blind_coords.size > 0:
+                        h, w = gt_img.shape[:2]
+                        x = blind_coords[:, 0]
+                        y = blind_coords[:, 1]
+                        valid = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+                        if np.any(valid):
+                            x = x[valid]
+                            y = y[valid]
+                            gt_vals = gt_img[y, x].astype(np.float64)
+                            out_vals = out_gray[y, x].astype(np.float64)
+                            err = out_vals - gt_vals
+                            blind_abs = np.abs(err)
+                            blind_sq = err ** 2
+
+                            blind_abs_sum += float(blind_abs.sum())
+                            blind_sq_sum += float(blind_sq.sum())
+                            blind_pix_sum += int(len(err))
+
+                            in_vals = in_resized[y, x].astype(np.float64)
+                            in_err = in_vals - gt_vals
+                            in_abs = np.abs(in_err)
+                            in_sq = in_err ** 2
+                            blind_abs_in_sum += float(in_abs.sum())
+                            blind_sq_in_sum += float(in_sq.sum())
+
+                            row.update({
+                                'blind_mae': float(blind_abs.mean()),
+                                'blind_rmse': float(np.sqrt(blind_sq.mean())),
+                                'blind_psnr': float(10.0 * np.log10((255.0 * 255.0) / max(float(blind_sq.mean()), 1e-12))),
+                                'blind_mae_input': float(in_abs.mean()),
+                                'blind_count': int(len(err))
+                            })
+                            if row['blind_mae_input'] is not None:
+                                row['blind_mae_gain_abs'] = row['blind_mae_input'] - row['blind_mae']
+                                row['blind_mae_gain_pct'] = 100.0 * row['blind_mae_gain_abs'] / (row['blind_mae_input'] + 1e-12)
+
+                    per_image_logs.append(row)
+                    group_rows.append(row)
                 else:
-                    in_resized = in_img
+                    cv2.imwrite(os.path.join(save_pure, name), out_gray)
 
-                # save triple visualization (input|output|gt)
-                triple = np.concatenate([in_resized, out_gray, gt_img], axis=1)
-                cv2.imwrite(os.path.join(save_triple, f'triple_{name}'), triple)
-                cv2.imwrite(os.path.join(save_pure, name), out_gray)
+                if (idx + 1) % 10 == 0:
+                    print(f'Processed {idx+1}/{len(group_files)} in group {group_name}')
 
-                # compute full-frame metrics
-                report.update_metric(gt_img, out_gray, name)
-                full_psnr = float(report.total_rgb_psnr[-1])
-                full_ssim = float(report.total_ssim[-1])
+            if len(group_rows) > 0:
+                group_dir = os.path.join(save_blind_dir, group_name)
+                os.makedirs(group_dir, exist_ok=True)
+                group_csv = os.path.join(group_dir, 'test_blind_metrics.csv')
+                keys = [
+                    'image', 'psnr', 'ssim',
+                    'blind_mae', 'blind_rmse', 'blind_psnr',
+                    'blind_mae_input', 'blind_mae_gain_abs', 'blind_mae_gain_pct', 'blind_count'
+                ]
+                with open(group_csv, 'w', encoding='utf-8', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=keys)
+                    writer.writeheader()
+                    for row in group_rows:
+                        writer.writerow(row)
+                print(f'Per-image test metrics saved to: {group_csv}')
 
-                row = {
-                    'image': name,
-                    'psnr': float(full_psnr),
-                    'ssim': float(full_ssim),
-                    'blind_mae': None,
-                    'blind_rmse': None,
-                    'blind_psnr': None,
-                    'blind_mae_input': None,
-                    'blind_mae_gain_abs': None,
-                    'blind_mae_gain_pct': None,
-                    'blind_count': 0
-                }
-
-                # blind metrics via coords CSV (if provided)
-                if blind_coords is not None and blind_coords.size > 0:
-                    h, w = gt_img.shape[:2]
-                    x = blind_coords[:, 0]
-                    y = blind_coords[:, 1]
-                    valid = (x >= 0) & (x < w) & (y >= 0) & (y < h)
-                    if np.any(valid):
-                        x = x[valid]
-                        y = y[valid]
-                        gt_vals = gt_img[y, x].astype(np.float64)
-                        out_vals = out_gray[y, x].astype(np.float64)
-                        err = out_vals - gt_vals
-                        blind_abs = np.abs(err)
-                        blind_sq = err ** 2
-
-                        blind_abs_sum += float(blind_abs.sum())
-                        blind_sq_sum += float(blind_sq.sum())
-                        blind_pix_sum += int(len(err))
-
-                        # input blind error
-                        in_vals = in_resized[y, x].astype(np.float64)
-                        in_err = in_vals - gt_vals
-                        in_abs = np.abs(in_err)
-                        in_sq = in_err ** 2
-                        blind_abs_in_sum += float(in_abs.sum())
-                        blind_sq_in_sum += float(in_sq.sum())
-
-                        row.update({
-                            'blind_mae': float(blind_abs.mean()),
-                            'blind_rmse': float(np.sqrt(blind_sq.mean())),
-                            'blind_psnr': float(10.0 * np.log10((255.0 * 255.0) / max(float(blind_sq.mean()), 1e-12))),
-                            'blind_mae_input': float(in_abs.mean()),
-                            'blind_count': int(len(err))
-                        })
-                        if row['blind_mae_input'] is not None:
-                            row['blind_mae_gain_abs'] = row['blind_mae_input'] - row['blind_mae']
-                            row['blind_mae_gain_pct'] = 100.0 * row['blind_mae_gain_abs'] / (row['blind_mae_input'] + 1e-12)
-
-                per_image_logs.append(row)
-            else:
-                # no gt, just save output
-                cv2.imwrite(os.path.join(save_pure, name), out_gray)
-
-            if (idx + 1) % 10 == 0:
-                print(f'Processed {idx+1}/{len(input_files)}')
+            per_group_logs[group_name].extend(group_rows)
 
     report.print_final_result()
 
