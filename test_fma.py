@@ -11,6 +11,24 @@ from models.network_swinir import SwinIR as Net
 from utils import util_calculate_psnr_ssim as util
 
 
+class TestReport:
+    def __init__(self, crop_border=0):
+        self.crop_border = crop_border
+        self.total_rgb_psnr = []
+        self.total_ssim = []
+
+    def update_metric(self, gt_img, out_img, img_name=None):
+        self.total_rgb_psnr.append(float(util.calculate_psnr(out_img, gt_img, crop_border=self.crop_border)))
+        self.total_ssim.append(float(util.calculate_ssim(out_img, gt_img, crop_border=self.crop_border)))
+
+    def print_final_result(self):
+        if len(self.total_rgb_psnr) == 0:
+            print('No valid images were evaluated.')
+            return
+        print(f'Average PSNR: {np.mean(self.total_rgb_psnr):.4f} dB')
+        print(f'Average SSIM: {np.mean(self.total_ssim):.4f}')
+
+
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
@@ -91,8 +109,10 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     save_triple = os.path.join(args.save_dir, 'triple_comparison')
     save_pure = os.path.join(args.save_dir, 'test')
+    save_blind_dir = os.path.join(args.save_dir, 'blind_eval')
     os.makedirs(save_triple, exist_ok=True)
     os.makedirs(save_pure, exist_ok=True)
+    os.makedirs(save_blind_dir, exist_ok=True)
 
     # build model and load checkpoint
     model = build_model(device, in_chans=args.in_chans)
@@ -145,17 +165,30 @@ def main():
                 input_files.append(os.path.join(root, f))
     input_files = sorted(input_files, key=natural_sort_key)
 
+    output_map = {}
+    input_map = {}
+    for in_path in input_files:
+        rel_in = os.path.normpath(os.path.relpath(in_path, input_root))
+        name = os.path.basename(in_path)
+        output_map[rel_in] = os.path.join(save_pure, name)
+        if name not in output_map:
+            output_map[name] = os.path.join(save_pure, name)
+        input_map[rel_in] = in_path
+        if name not in input_map:
+            input_map[name] = in_path
+
     # load blind coords (CSV) if provided
     blind_coords = load_blind_coords(args.test_mask_csv) if args.test_mask_csv else None
 
-    per_image_logs = []
+    report = TestReport(crop_border=args.image_border)
     blind_abs_sum = 0.0
     blind_sq_sum = 0.0
     blind_abs_in_sum = 0.0
     blind_sq_in_sum = 0.0
     blind_pix_sum = 0
+    per_image_logs = []
 
-    print(f'===> Start testing {len(input_files)} images...')
+    print(f'===> 开始定量打分，准备比对 {len(input_files)} 张图片...')
     with torch.no_grad():
         for idx, in_path in enumerate(input_files):
             name = os.path.basename(in_path)
@@ -200,8 +233,9 @@ def main():
                 cv2.imwrite(os.path.join(save_pure, name), out_gray)
 
                 # compute full-frame metrics
-                full_psnr = util.calculate_psnr(out_gray, gt_img, crop_border=args.image_border)
-                full_ssim = util.calculate_ssim(out_gray, gt_img, crop_border=args.image_border)
+                report.update_metric(gt_img, out_gray, name)
+                full_psnr = float(report.total_rgb_psnr[-1])
+                full_ssim = float(report.total_ssim[-1])
 
                 row = {
                     'image': name,
@@ -262,16 +296,22 @@ def main():
             if (idx + 1) % 10 == 0:
                 print(f'Processed {idx+1}/{len(input_files)}')
 
+    report.print_final_result()
+
     # write per-image CSV
-    csv_path = os.path.join(args.save_dir, 'per_image_metrics.csv')
+    csv_path = os.path.join(save_blind_dir, 'test_blind_metrics.csv')
     if len(per_image_logs) > 0:
-        keys = list(per_image_logs[0].keys())
+        keys = [
+            'image', 'psnr', 'ssim',
+            'blind_mae', 'blind_rmse', 'blind_psnr',
+            'blind_mae_input', 'blind_mae_gain_abs', 'blind_mae_gain_pct', 'blind_count'
+        ]
         with open(csv_path, 'w', encoding='utf-8', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=keys)
             writer.writeheader()
             for r in per_image_logs:
                 writer.writerow(r)
-        print('Saved per-image metrics to', csv_path)
+        print('Per-image test metrics saved to:', csv_path)
 
     # aggregate blind metrics
     if blind_pix_sum > 0:
@@ -291,6 +331,9 @@ def main():
             gain_abs = blind_mae_in - blind_mae
             gain_pct = 100.0 * gain_abs / (blind_mae_in + 1e-12)
             print(f'Input Blind MAE: {blind_mae_in:.6f} | Input Blind PSNR: {blind_psnr_in:.3f} | MAE Gain: {gain_abs:.6f} ({gain_pct:.2f}%)')
+
+        if len(per_image_logs) > 0:
+            print(f'Blind per-image metrics saved to: {csv_path}')
 
 
 if __name__ == '__main__':
