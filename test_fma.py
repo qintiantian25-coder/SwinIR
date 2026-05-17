@@ -53,9 +53,26 @@ def load_blind_coords(csv_path):
     return arr
 
 
+def load_blind_coords_from_paths(csv_paths):
+    all_coords = []
+    for csv_path in csv_paths:
+        coords = load_blind_coords(csv_path)
+        if coords is not None and coords.size > 0:
+            all_coords.append(coords)
+    if len(all_coords) == 0:
+        return None
+    if len(all_coords) == 1:
+        return all_coords[0]
+    merged = np.concatenate(all_coords, axis=0)
+    merged = np.unique(merged.astype(np.int32), axis=0)
+    return merged
+
+
 def resolve_csv_path(csv_path, data_root):
     if not csv_path:
         return None
+    if os.path.isdir(csv_path):
+        return csv_path
     if os.path.isabs(csv_path) and os.path.exists(csv_path):
         return csv_path
     if os.path.exists(csv_path):
@@ -65,6 +82,52 @@ def resolve_csv_path(csv_path, data_root):
         if os.path.exists(candidate):
             return candidate
     return csv_path
+
+
+def resolve_group_blind_csvs(mask_base_path, data_root, group_name):
+    candidates = []
+    if mask_base_path:
+        if os.path.isdir(mask_base_path):
+            candidates.append(os.path.join(mask_base_path, group_name, 'blind_coords.csv'))
+            candidates.append(os.path.join(mask_base_path, group_name, 'blind_pixel_coords.csv'))
+            candidates.append(os.path.join(mask_base_path, group_name, 'flash_pixel_coords.csv'))
+            candidates.append(os.path.join(mask_base_path, group_name, 'blind_coords.csv'))
+        else:
+            candidates.append(mask_base_path)
+            if data_root and not os.path.isabs(mask_base_path):
+                candidates.append(os.path.join(data_root, mask_base_path))
+            base_dir = os.path.dirname(mask_base_path)
+            if base_dir:
+                candidates.append(os.path.join(base_dir, group_name, os.path.basename(mask_base_path)))
+    if data_root:
+        candidates.append(os.path.join(data_root, 'test_mask', group_name, 'blind_pixel_coords.csv'))
+        candidates.append(os.path.join(data_root, 'test_mask', group_name, 'flash_pixel_coords.csv'))
+        candidates.append(os.path.join(data_root, 'test_mask', group_name, 'blind_coords.csv'))
+
+    seen = set()
+    found = []
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.exists(candidate):
+            found.append(candidate)
+
+    # If a unified blind_coords.csv exists, prefer it.
+    for candidate in found:
+        if os.path.basename(candidate) == 'blind_coords.csv':
+            return [candidate]
+
+    # Otherwise combine blind_pixel_coords.csv + flash_pixel_coords.csv if present.
+    combo = []
+    for candidate in found:
+        base = os.path.basename(candidate)
+        if base in ('blind_pixel_coords.csv', 'flash_pixel_coords.csv'):
+            combo.append(candidate)
+    if len(combo) > 0:
+        return combo
+
+    return found
 
 
 def build_model(device, in_chans=3):
@@ -192,14 +255,8 @@ def main():
         rel_in = os.path.normpath(os.path.relpath(in_path, input_root))
         grouped_inputs[get_group_name(rel_in)].append(in_path)
 
-    # load blind coords (CSV) if provided
+    # blind coords are loaded per test group so each subfolder can use its own CSV
     resolved_test_mask_csv = resolve_csv_path(args.test_mask_csv, args.data_root)
-    blind_coords = load_blind_coords(resolved_test_mask_csv) if resolved_test_mask_csv else None
-    if args.test_mask_csv and blind_coords is None:
-        print(f'WARN: blind coords CSV not loaded: {resolved_test_mask_csv}')
-        print('WARN: blind metrics will stay empty until the CSV path is correct and the file has x,y columns.')
-    elif blind_coords is not None:
-        print(f'Loaded blind coords from: {resolved_test_mask_csv} ({len(blind_coords)} unique points)')
 
     report = TestReport(crop_border=args.image_border)
     blind_abs_sum = 0.0
@@ -215,6 +272,26 @@ def main():
         for group_name, group_files in grouped_inputs.items():
             print(f'===> Processing group {group_name} ({len(group_files)} images) ...')
             group_rows = []
+            group_mask_csvs = resolve_group_blind_csvs(resolved_test_mask_csv, args.data_root, group_name)
+            blind_coords = load_blind_coords_from_paths(group_mask_csvs) if group_mask_csvs else None
+            if group_mask_csvs and blind_coords is not None:
+                print(f'Loaded blind coords for group {group_name} from: {group_mask_csvs} ({len(blind_coords)} unique points)')
+            elif group_mask_csvs:
+                print(f'WARN: blind coords CSV not loaded for group {group_name}: {group_mask_csvs}')
+                print('WARN: blind metrics will stay empty until the CSV path is correct and the file has x,y columns.')
+            else:
+                print(f'WARN: no blind coords CSV found for group {group_name}')
+
+            if blind_coords is not None and len(group_mask_csvs) > 1:
+                group_dir = os.path.join(save_blind_dir, group_name)
+                os.makedirs(group_dir, exist_ok=True)
+                merged_csv = os.path.join(group_dir, 'blind_coords.csv')
+                with open(merged_csv, 'w', encoding='utf-8', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['x', 'y'])
+                    for x, y in blind_coords.tolist():
+                        writer.writerow([int(x), int(y)])
+                print(f'Combined blind coords saved to: {merged_csv}')
 
             for idx, in_path in enumerate(group_files):
                 name = os.path.basename(in_path)
