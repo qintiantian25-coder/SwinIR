@@ -96,9 +96,30 @@ def main():
 
     # build model and load checkpoint
     model = build_model(device, in_chans=args.in_chans)
-    ckpt = torch.load(args.checkpoint, map_location='cpu')
-    # ckpt may contain 'model' or full state dict
+    # Try normal safe loading first; if it fails (new PyTorch weights_only restrictions),
+    # fall back to allowing the needed numpy global and load with weights_only=False.
+    try:
+        ckpt = torch.load(args.checkpoint, map_location='cpu')
+    except Exception as e:
+        try:
+            # allowlist numpy scalar type used by some older checkpoints
+            try:
+                torch.serialization.add_safe_globals([np._core.multiarray.scalar])
+            except Exception:
+                pass
+            ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+        except Exception:
+            raise
+
+    # ckpt may contain 'model' or be a plain state dict
     state = ckpt.get('model', ckpt)
+    # if checkpoint was saved from DataParallel, strip the 'module.' prefix
+    if isinstance(state, dict):
+        new_state = {}
+        for k, v in state.items():
+            new_k = k[7:] if k.startswith('module.') else k
+            new_state[new_k] = v
+        state = new_state
     model.load_state_dict(state)
     model.eval()
 
